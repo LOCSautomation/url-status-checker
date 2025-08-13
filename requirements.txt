@@ -1,4 +1,3 @@
 httpx
-argparse
 tqdm
 colorama
