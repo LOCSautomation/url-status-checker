@@ -11,7 +11,8 @@ from email.message import EmailMessage
 import time
 from datetime import datetime, timezone
 import getpass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Callable
+from abc import ABC, abstractmethod
 import os
 import sys
 import atexit
@@ -19,29 +20,11 @@ import signal
 import subprocess
 import shutil
 
-# Banner (ASCII, centered)
-def build_ascii_banner() -> str:
-    lines = [
-        "StatusChecker.py",
-        "Created By: BLACK_SCORP10",
-        "Telegram: @BLACK_SCORP10",
-    ]
-    width = max(len(s) for s in lines)
-    width = max(width, 28)
-    top = "=" * (width + 4)
-    body = "\n".join([f"| {s.center(width)} |" for s in lines])
-    bottom = "=" * (width + 4)
-    return f"{top}\n{body}\n{bottom}"
+################################################################################
+# GLOBALS SECTION
+################################################################################
 
-# Color Codes
-COLORS = {
-    "1xx": Fore.WHITE,
-    "2xx": Fore.GREEN,
-    "3xx": Fore.YELLOW,
-    "4xx": Fore.RED,
-    "5xx": Fore.LIGHTRED_EX,
-    "Invalid": Fore.WHITE
-}
+# (Removed unused ASCII banner builder and COLORS mapping)
 
 # Debug flag (set from --debug)
 DEBUG = False
@@ -76,7 +59,11 @@ def print_header_box() -> None:
         print(Style.BRIGHT + Fore.WHITE + bottom + Style.RESET_ALL)
     print()
 
-# Function to resolve hostname to IP:Port
+################################################################################
+# FUNCTIONS SECTION — NETWORK UTILITIES
+################################################################################
+
+# Resolve hostname to IP:Port for a URL
 def resolve_ip_and_port(url):
     try:
         parsed = urlparse(url)
@@ -128,63 +115,133 @@ async def get_certificate_info(hostname: str, port: int) -> Optional[Dict[str, s
     return await loop.run_in_executor(None, _get_certificate_info_sync, hostname, port)
 
 
-# Function to check URL status and redirection with optional expert details
-async def check_url_status(session, url_id: int, url: str, expert: bool = False):
-    original_input_url = url
-    if "://" not in url:
-        url = "https://" + url
+################################################################################
+# FUNCTIONS SECTION — URL STATUS COLLECTION (BEGINNER/EXPERT FLOWS)
+################################################################################
+
+def normalize_url_if_scheme_missing(input_url: str) -> str:
+    if "://" not in input_url:
+        return "https://" + input_url
+    return input_url
+
+
+async def perform_http_get(session: httpx.AsyncClient, url: str) -> Optional[httpx.Response]:
     try:
         start_time = time.perf_counter()
         response = await session.get(url, follow_redirects=True, timeout=10)
-        elapsed_ms = int((time.perf_counter() - start_time) * 1000)
-        final_url = str(response.url)
-
-        original_ip_port = resolve_ip_and_port(url)
-        redirect_ip_port = resolve_ip_and_port(final_url) if final_url != url else None
-
-        result = {
-            "url_id": url_id,
-            "input_url": original_input_url,
-            "checked_url": url,
-            "status_code": response.status_code,
-            "final_url": final_url if final_url != url else None,
-            "original_ip_port": original_ip_port,
-            "redirect_ip_port": redirect_ip_port,
-            "elapsed_ms": elapsed_ms,
-        }
-
-        if expert:
-            # Additional details for expert mode
-            http_version = getattr(response, "http_version", None)
-            server_header = response.headers.get("server")
-            content_length = response.headers.get("content-length")
-            redirect_chain = [str(r.url) for r in getattr(response, "history", [])] if hasattr(response, "history") else []
-
-            result.update({
-                "http_version": http_version,
-                "server": server_header,
-                "content_length": content_length,
-                "redirect_chain": redirect_chain,
-                "certificate": None,
-            })
-
-            parsed = urlparse(url)
-            if parsed.scheme == "https" and parsed.hostname:
-                cert_info = await get_certificate_info(parsed.hostname, parsed.port or 443)
-                result["certificate"] = cert_info
-
-        return result
+        # Attach elapsed_ms so downstream does not recompute clock
+        setattr(response, "_elapsed_ms", int((time.perf_counter() - start_time) * 1000))
+        return response
     except httpx.RequestError:
-        return {
-            "url_id": url_id,
-            "input_url": original_input_url,
-            "checked_url": url,
-            "status_code": None,
-            "final_url": None,
-            "original_ip_port": None,
-            "redirect_ip_port": None,
-            "elapsed_ms": None,
-        }
+        return None
+
+
+async def perform_http_head(session: httpx.AsyncClient, url: str) -> Optional[httpx.Response]:
+    try:
+        start_time = time.perf_counter()
+        response = await session.head(url, follow_redirects=True, timeout=10)
+        setattr(response, "_elapsed_ms", int((time.perf_counter() - start_time) * 1000))
+        return response
+    except httpx.RequestError:
+        return None
+
+
+def build_basic_result_none_response(url_id: int, original_input_url: str, checked_url: str) -> Dict:
+    return {
+        "url_id": url_id,
+        "input_url": original_input_url,
+        "checked_url": checked_url,
+        "status_code": None,
+        "final_url": None,
+        "original_ip_port": None,
+        "redirect_ip_port": None,
+        "elapsed_ms": None,
+    }
+
+def build_basic_result_with_response(
+    url_id: int, original_input_url: str, checked_url: str, response: httpx.Response
+) -> Dict:
+    final_url = str(response.url)
+    original_ip_port = resolve_ip_and_port(checked_url)
+    redirect_ip_port = resolve_ip_and_port(final_url) if final_url != checked_url else None
+    return {
+        "url_id": url_id,
+        "input_url": original_input_url,
+        "checked_url": checked_url,
+        "status_code": response.status_code,
+        "final_url": final_url if final_url != checked_url else None,
+        "original_ip_port": original_ip_port,
+        "redirect_ip_port": redirect_ip_port,
+        "elapsed_ms": getattr(response, "_elapsed_ms", None),
+    }
+
+def build_basic_result(url_id: int, original_input_url: str, checked_url: str, response: Optional[httpx.Response]) -> Dict:
+    if response is None:
+        return build_basic_result_none_response(url_id, original_input_url, checked_url)
+    return build_basic_result_with_response(url_id, original_input_url, checked_url, response)
+
+async def fetch_url_status_basic(session: httpx.AsyncClient, url_id: int, url: str) -> Dict:
+    input_url = url
+    checked_url = normalize_url_if_scheme_missing(url)
+    response = await perform_http_get(session, checked_url)
+    return build_basic_result(url_id, input_url, checked_url, response)
+
+def update_base_with_expert_none_fields(base: Dict) -> None:
+    base.update({
+        "http_version": None,
+        "server": None,
+        "content_length": None,
+        "redirect_chain": [],
+        "certificate": None,
+    })
+
+def extract_head_response_details(head_response: Optional[httpx.Response]) -> Tuple[Optional[str], Optional[str], Optional[str], List[str]]:
+    http_version = getattr(head_response, "http_version", None) if head_response else None
+    server_header = head_response.headers.get("server") if head_response else None
+    content_length = head_response.headers.get("content-length") if head_response else None
+    redirect_chain: List[str] = []
+    try:
+        if head_response is not None and hasattr(head_response, "history"):
+            redirect_chain = [str(r.url) for r in head_response.history]  # type: ignore[attr-defined]
+    except Exception:
+        redirect_chain = []
+    return http_version, server_header, content_length, redirect_chain
+
+async def add_certificate_info_if_https(base: Dict, checked_url: str) -> None:
+    try:
+        parsed = urlparse(checked_url)
+        if parsed.scheme == "https" and parsed.hostname:
+            cert_info = await get_certificate_info(parsed.hostname, parsed.port or 443)
+            base["certificate"] = cert_info
+        else:
+            base["certificate"] = None
+    except Exception:
+        base["certificate"] = None
+
+async def fetch_url_status_with_expert_details(session: httpx.AsyncClient, url_id: int, url: str) -> Dict:
+    base = await fetch_url_status_basic(session, url_id, url)
+    if base.get("status_code") is None and base.get("final_url") is None:
+        update_base_with_expert_none_fields(base)
+        return base
+
+    checked_url = base.get("checked_url") or normalize_url_if_scheme_missing(url)
+    head_response = await perform_http_head(session, checked_url)
+    http_version, server_header, content_length, redirect_chain = extract_head_response_details(head_response)
+
+    base.update({
+        "http_version": http_version,
+        "server": server_header,
+        "content_length": content_length,
+        "redirect_chain": redirect_chain,
+        "certificate": None,
+    })
+
+    await add_certificate_info_if_https(base, checked_url)
+    return base
+
+################################################################################
+# FUNCTIONS SECTION — CLI ARGUMENTS AND SETTINGS
+################################################################################
 
 # Argument parser
 def parse_arguments():
@@ -193,7 +250,7 @@ def parse_arguments():
     parser.add_argument("-l", "--list", help="File containing list of domains/URLs to check")
     parser.add_argument("-o", "--output", help="File to save the output")
     parser.add_argument("-m", "--mode", choices=["beginner", "expert"], help="Output mode: beginner or expert")
-    parser.add_argument("--monitor", action="store_true", help="Continuously monitor until stopped")
+    parser.add_argument("--monitor", action="store_true", default=None, help="Continuously monitor until stopped")
     parser.add_argument("--interval", type=int, default=60, help="Seconds between checks when monitoring (default: 60)")
     parser.add_argument("--notify", choices=["none", "email", "sms", "both"], help="Send notification on downtime")
     parser.add_argument("--email", help="Email address to send notifications to (and from)")
@@ -317,83 +374,13 @@ atexit.register(lambda: SESSION_CACHE.clear())
 
 
 def prompt_for_settings(args) -> Dict:
-    # Output mode
-    mode = args.mode
-    if not mode:
-        mode = input("Choose mode [B]eginner/[E]xpert (default B): ").strip().lower()
-        mode = "expert" if mode.startswith("e") else "beginner"
-
-    # Monitoring
-    monitor = args.monitor
-    if not monitor:
-        monitor_in = input("Monitor continuously? [y/N]: ").strip().lower()
-        monitor = monitor_in.startswith("y")
-
-    interval = args.interval or 60
-    if monitor and (not args.interval):
-        try:
-            interval = int(input("Seconds between checks (default 60): ").strip() or "60")
-        except ValueError:
-            interval = 60
-
-    # Notifications
-    notify = args.notify
-    if not notify:
-        notify_in = input("Notifications on downtime? [n]one/[e]mail/[s]ms/[b]oth (default n): ").strip().lower()
-        if notify_in.startswith("e"):
-            notify = "email"
-        elif notify_in.startswith("s"):
-            notify = "sms"
-        elif notify_in.startswith("b"):
-            notify = "both"
-        else:
-            notify = "none"
-
-    email_addr = args.email
-    smtp_server = args.smtp_server
-    smtp_port = args.smtp_port
-    smtp_username = args.smtp_username
-    # Prefer env var for password if provided; flags are last resort
-    smtp_password = os.getenv("SMTP_APP_PASSWORD") or args.smtp_password
-    sms_number = args.sms_number
-    sms_carrier = args.sms_carrier
-
-    if notify in ("email", "both", "sms"):
-        # Collect minimal info
-        if notify in ("email", "both") and not email_addr:
-            email_addr = input("Enter your email (used to send alerts): ").strip()
-        if notify in ("sms", "both") and not sms_number:
-            sms_number = input("Enter phone number for SMS (digits only): ").strip()
-        if notify in ("sms", "both") and not sms_carrier:
-            sms_carrier = input("Carrier for SMS [att/verizon/tmobile/sprint]: ").strip().lower()
-
-        # Simplified SMTP config (we use email even for SMS via gateway)
-        if notify in ("email", "both", "sms") and (not smtp_server or not smtp_port or not smtp_username or not smtp_password):
-            # Username defaults to your email
-            if not smtp_username:
-                smtp_username = (email_addr or "").strip() or input("Enter your email (used to send alerts): ").strip()
-                if not email_addr:
-                    email_addr = smtp_username
-            # Infer server/port from email provider; avoid asking about ports
-            if not smtp_server or not smtp_port:
-                provider_guess = infer_email_provider_from_address(smtp_username)
-                if provider_guess == "unknown":
-                    provider_choice = input("Your email provider [gmail/outlook/yahoo/icloud/office365] (default gmail): ").strip().lower()
-                    if provider_choice not in ("gmail", "outlook", "yahoo", "icloud", "office365"):
-                        provider_choice = "gmail"
-                    smtp_server, smtp_port = smtp_settings_for_provider(provider_choice)
-                else:
-                    smtp_server, smtp_port = smtp_settings_for_provider(provider_guess)
-            # Ask for password last, keep in session cache only (unless --no-prompt)
-            cached_pw = get_session_secret("smtp_password")
-            if cached_pw:
-                smtp_password = cached_pw
-            if not smtp_password and not getattr(args, "no_prompt", False):
-                if getattr(args, "show_password", False):
-                    smtp_password = input("Email password (visible): ")
-                else:
-                    smtp_password = getpass.getpass("Email password (use an app password if required): ")
-            set_session_secret("smtp_password", smtp_password)
+    mode = get_mode_from_args_or_prompt(args)
+    monitor = get_monitor_from_args_or_prompt(args)
+    interval = get_interval_from_args_or_prompt(args, monitor)
+    notify = get_notify_from_args_or_prompt(args)
+    email_addr, smtp_server, smtp_port, smtp_username, smtp_password, sms_number, sms_carrier = get_notification_details_from_args_or_prompt(
+        args, notify
+    )
 
     return {
         "mode": mode,
@@ -409,6 +396,112 @@ def prompt_for_settings(args) -> Dict:
         "sms_number": sms_number,
         "sms_carrier": sms_carrier,
     }
+
+
+def get_mode_from_args_or_prompt(args) -> str:
+    mode = args.mode
+    if mode:
+        return mode
+    if getattr(args, "no_prompt", False):
+        return "beginner"
+    mode = input("Choose mode [B]eginner/[E]xpert (default B): ").strip().lower()
+    return "expert" if mode.startswith("e") else "beginner"
+
+def get_monitor_from_args_or_prompt(args) -> bool:
+    monitor = args.monitor
+    if monitor is not None:
+        return bool(monitor)
+    if getattr(args, "no_prompt", False):
+        return False
+    monitor_in = input("Monitor continuously? [y/N]: ").strip().lower()
+    return monitor_in.startswith("y")
+
+def get_interval_from_args_or_prompt(args, monitor: bool) -> int:
+    interval = args.interval or 60
+    if not monitor:
+        return interval
+    if getattr(args, "no_prompt", False) or args.interval:
+        return interval
+    try:
+        interval = int(input("Seconds between checks (default 60): ").strip() or "60")
+    except ValueError:
+        interval = 60
+    return interval
+
+def get_notify_from_args_or_prompt(args) -> str:
+    notify = args.notify
+    if notify:
+        return notify
+    if getattr(args, "no_prompt", False):
+        return "none"
+    notify_in = input("Notifications on downtime? [n]one/[e]mail/[s]ms/[b]oth (default n): ").strip().lower()
+    if notify_in.startswith("e"):
+        return "email"
+    if notify_in.startswith("s"):
+        return "sms"
+    if notify_in.startswith("b"):
+        return "both"
+    return "none"
+
+def get_notification_details_from_args_or_prompt(args, notify: str):
+    email_addr = args.email
+    smtp_server = args.smtp_server
+    smtp_port = args.smtp_port
+    smtp_username = args.smtp_username
+    smtp_password = os.getenv("SMTP_APP_PASSWORD") or args.smtp_password
+    sms_number = args.sms_number
+    sms_carrier = args.sms_carrier
+
+    if notify in ("email", "both", "sms"):
+        if getattr(args, "no_prompt", False):
+            # In no-prompt mode, do not ask for missing inputs; leave None/empty
+            pass
+        else:
+            if notify in ("email", "both") and not email_addr:
+                email_addr = input("Enter your email (used to send alerts): ").strip()
+            if notify in ("sms", "both") and not sms_number:
+                sms_number = input("Enter phone number for SMS (digits only): ").strip()
+            if notify in ("sms", "both") and not sms_carrier:
+                sms_carrier = input("Carrier for SMS [att/verizon/tmobile/sprint]: ").strip().lower()
+
+        if notify in ("email", "both", "sms") and (not smtp_server or not smtp_port or not smtp_username or not smtp_password):
+            if not getattr(args, "no_prompt", False):
+                smtp_username, email_addr = get_smtp_username_and_email(smtp_username, email_addr)
+                smtp_server, smtp_port = get_smtp_server_and_port(smtp_server, smtp_port, smtp_username)
+                smtp_password = get_smtp_password(smtp_password, args)
+                set_session_secret("smtp_password", smtp_password)
+
+    return email_addr, smtp_server, smtp_port, smtp_username, smtp_password, sms_number, sms_carrier
+
+def get_smtp_username_and_email(smtp_username, email_addr):
+    if not smtp_username:
+        smtp_username = (email_addr or "").strip() or input("Enter your email (used to send alerts): ").strip()
+        if not email_addr:
+            email_addr = smtp_username
+    return smtp_username, email_addr
+
+def get_smtp_server_and_port(smtp_server, smtp_port, smtp_username):
+    if not smtp_server or not smtp_port:
+        provider_guess = infer_email_provider_from_address(smtp_username)
+        if provider_guess == "unknown":
+            provider_choice = input("Your email provider [gmail/outlook/yahoo/icloud/office365] (default gmail): ").strip().lower()
+            if provider_choice not in ("gmail", "outlook", "yahoo", "icloud", "office365"):
+                provider_choice = "gmail"
+            smtp_server, smtp_port = smtp_settings_for_provider(provider_choice)
+        else:
+            smtp_server, smtp_port = smtp_settings_for_provider(provider_guess)
+    return smtp_server, smtp_port
+
+def get_smtp_password(smtp_password, args):
+    cached_pw = get_session_secret("smtp_password")
+    if cached_pw:
+        smtp_password = cached_pw
+    if not smtp_password and not getattr(args, "no_prompt", False):
+        if getattr(args, "show_password", False):
+            smtp_password = input("Email password (visible): ")
+        else:
+            smtp_password = getpass.getpass("Email password (use an app password if required): ")
+    return smtp_password
 
 
 def send_email_via_smtp(smtp_server: str, smtp_port: int, smtp_username: str, smtp_password: str,
@@ -551,6 +644,10 @@ def register_history_scrubber(args) -> None:
         pass
 
 
+################################################################################
+# FUNCTIONS SECTION — NOTIFICATIONS
+################################################################################
+
 def build_notification_targets(settings: Dict) -> List[str]:
     recipients: List[str] = []
     if settings["notify"] in ("email", "both") and settings.get("email"):
@@ -565,15 +662,12 @@ def build_notification_targets(settings: Dict) -> List[str]:
             recipients.append(sms_addr)
     return recipients
 
-def print_beginner_view(results: Dict[int, Dict], show_spinner: bool = True) -> None:
-    # Spinner not needed when progress bar is shown above; keep for fallback
-    if show_spinner:
-        try:
-            for _ in tqdm(range(16), desc="Checking", ncols=60, ascii=True, leave=False):
-                time.sleep(0.05)
-        except Exception:
-            pass
 
+################################################################################
+# FUNCTIONS SECTION — PRESENTATION (BEGINNER/EXPERT)
+################################################################################
+
+def render_beginner_results(results: Dict[int, Dict]) -> None:
     # Determine simple summary: Good (green), Caution (yellow), Website Down (red)
     has_down = False
     has_warning = False
@@ -615,7 +709,7 @@ def print_beginner_view(results: Dict[int, Dict], show_spinner: bool = True) -> 
             state = "DOWN"
         print(line_color + f"[{state}] {url} [Status : {status}]" + Style.RESET_ALL)
 
-def print_results(results: Dict[int, Dict], mode: str):
+def render_expert_results(results: Dict[int, Dict]) -> None:
     status_codes: Dict[str, List[Tuple[int, Dict]]] = {
         "1xx": [],
         "2xx": [],
@@ -656,27 +750,27 @@ def print_results(results: Dict[int, Dict], mode: str):
         for _, data in items:
             url = data.get("input_url") or data.get("checked_url")
             status = data.get("status_code") or "Invalid"
-            if mode == "beginner":
-                state = "UP" if isinstance(status, int) and 200 <= status < 400 else "DOWN"
-                print(f"[{state}] {url} [Status : {status}]")
+            # Expert line: color entire line by group
+            line_color = Fore.WHITE
+            if code == "2xx":
+                line_color = Fore.GREEN
+            elif code == "3xx":
+                line_color = Fore.YELLOW
+            elif code in ("4xx", "5xx", "Invalid"):
+                line_color = Fore.RED
             else:
-                # Expert line: color entire line by group
                 line_color = Fore.WHITE
-                if code == "2xx":
-                    line_color = Fore.GREEN
-                elif code == "3xx":
-                    line_color = Fore.YELLOW
-                elif code in ("4xx", "5xx", "Invalid"):
-                    line_color = Fore.RED
-                else:
-                    line_color = Fore.WHITE
-                print(line_color + f"[Status : {status}] = {url}" + Style.RESET_ALL)
+            print(line_color + f"[Status : {status}] = {url}" + Style.RESET_ALL)
         print(Style.RESET_ALL)
 
 
-async def run_checks_once(urls: List[str], expert: bool) -> Dict[int, Dict]:
+################################################################################
+# FUNCTIONS SECTION — ORCHESTRATORS FOR CHECK RUNS
+################################################################################
+
+async def run_beginner_checks_once(urls: List[str]) -> Dict[int, Dict]:
     async with httpx.AsyncClient() as session:
-        tasks = [check_url_status(session, url_id, url, expert=expert) for url_id, url in enumerate(urls)]
+        tasks = [fetch_url_status_basic(session, url_id, url) for url_id, url in enumerate(urls)]
         results: Dict[int, Dict] = {}
         for coro in asyncio.as_completed(tasks):
             data = await coro
@@ -684,17 +778,22 @@ async def run_checks_once(urls: List[str], expert: bool) -> Dict[int, Dict]:
         return results
 
 
-def summarize_state(results: Dict[int, Dict]) -> Tuple[int, int]:
-    up = 0
-    down = 0
-    for _, data in results.items():
-        status = data.get("status_code")
-        if isinstance(status, int) and 200 <= status < 400:
-            up += 1
-        else:
-            down += 1
-    return up, down
+async def run_expert_checks_once(urls: List[str]) -> Dict[int, Dict]:
+    async with httpx.AsyncClient() as session:
+        tasks = [fetch_url_status_with_expert_details(session, url_id, url) for url_id, url in enumerate(urls)]
+        results: Dict[int, Dict] = {}
+        for coro in asyncio.as_completed(tasks):
+            data = await coro
+            results[data["url_id"]] = data
+        return results
 
+
+# (Removed unused summarize_state helper)
+
+
+################################################################################
+# FUNCTIONS SECTION — MESSAGE BUILDERS
+################################################################################
 
 def build_down_message(url: str, data: Dict) -> str:
     status = data.get("status_code")
@@ -713,6 +812,204 @@ def build_down_message(url: str, data: Dict) -> str:
     ]
     return "\n".join(lines)
 
+
+################################################################################
+# FUNCTIONS SECTION — DOWN CONFIRMATION BEFORE ALERTING
+################################################################################
+
+def evaluate_http_up(status_code: Optional[int]) -> bool:
+    return isinstance(status_code, int) and 200 <= status_code < 400
+
+
+async def confirm_url_is_down(url: str) -> bool:
+    checked_url = normalize_url_if_scheme_missing(url)
+    try:
+        async with httpx.AsyncClient() as session:
+            # First confirmation
+            first = await perform_http_get(session, checked_url)
+            if first is not None and evaluate_http_up(first.status_code):
+                return False
+
+            # Small delay before the second attempt
+            await asyncio.sleep(2)
+
+            # Second confirmation via GET
+            second = await perform_http_get(session, checked_url)
+            if second is not None and evaluate_http_up(second.status_code):
+                return False
+
+            # Alternate method via HEAD
+            head = await perform_http_head(session, checked_url)
+            if head is not None and evaluate_http_up(head.status_code):
+                return False
+
+            # Treat as down only if all checks failed
+            return True
+    except Exception:
+        # On unexpected errors, fail-safe to not alert unless both probes fail
+        return False
+
+
+################################################################################
+# CLASSES SECTION — NOTIFIER ABSTRACTIONS
+################################################################################
+
+class Notifier:
+    async def send_alert(self, subject: str, body: str) -> bool:
+        raise NotImplementedError
+
+
+class EmailNotifier(Notifier):
+    def __init__(self, smtp_server: str, smtp_port: int, smtp_username: str, smtp_password: Optional[str], sender: str, recipients: List[str]) -> None:
+        self.smtp_server = smtp_server
+        self.smtp_port = smtp_port
+        self.smtp_username = smtp_username
+        self.smtp_password = smtp_password or ""
+        self.sender = sender
+        self.recipients = recipients
+
+    async def send_alert(self, subject: str, body: str) -> bool:
+        return await asyncio.to_thread(
+            send_email_via_smtp,
+            self.smtp_server,
+            self.smtp_port,
+            self.smtp_username,
+            self.smtp_password,
+            subject,
+            body,
+            self.sender,
+            self.recipients,
+        )
+
+
+class NullNotifier(Notifier):
+    async def send_alert(self, subject: str, body: str) -> bool:
+        return True
+
+
+def build_notifier_from_settings(settings: Dict, smtp_password: Optional[str], recipients: List[str]) -> Notifier:
+    if settings.get("notify") == "none" or not recipients:
+        return NullNotifier()
+    sender = settings.get("email") or settings.get("smtp_username") or ""
+    return EmailNotifier(
+        settings["smtp_server"],
+        settings["smtp_port"],
+        settings["smtp_username"],
+        smtp_password,
+        sender,
+        recipients,
+    )
+
+
+################################################################################
+# CLASSES SECTION — MODE HANDLERS (POLYMORPHIC)
+################################################################################
+
+class ModeHandler(ABC):
+    @abstractmethod
+    async def run_once(self, urls: List[str]) -> Dict[int, Dict]:
+        ...
+
+    @abstractmethod
+    def render(self, results: Dict[int, Dict]) -> None:
+        ...
+
+
+class BeginnerModeHandler(ModeHandler):
+    async def run_once(self, urls: List[str]) -> Dict[int, Dict]:
+        return await run_beginner_checks_once(urls)
+
+    def render(self, results: Dict[int, Dict]) -> None:
+        render_beginner_results(results)
+
+
+class ExpertModeHandler(ModeHandler):
+    async def run_once(self, urls: List[str]) -> Dict[int, Dict]:
+        return await run_expert_checks_once(urls)
+
+    def render(self, results: Dict[int, Dict]) -> None:
+        render_expert_results(results)
+
+
+def build_mode_handler_from_settings(settings: Dict) -> ModeHandler:
+    if settings.get("mode") == "expert":
+        return ExpertModeHandler()
+    return BeginnerModeHandler()
+
+
+################################################################################
+# CLASSES SECTION — DOWN CONFIRMATION POLICIES (POLYMORPHIC)
+################################################################################
+
+class DownConfirmationPolicy(ABC):
+    @abstractmethod
+    async def confirm(self, url: str) -> bool:
+        ...
+
+
+class NoopDownConfirmationPolicy(DownConfirmationPolicy):
+    async def confirm(self, url: str) -> bool:
+        return True
+
+
+class DoubleProbeDownConfirmationPolicy(DownConfirmationPolicy):
+    async def confirm(self, url: str) -> bool:
+        return await confirm_url_is_down(url)
+
+
+def build_down_confirmation_policy(settings: Dict) -> DownConfirmationPolicy:
+    # For now, always use double-probe confirmation; can be made configurable later
+    return DoubleProbeDownConfirmationPolicy()
+
+
+################################################################################
+# CLASSES SECTION — RESULTS SINK (POLYMORPHIC)
+################################################################################
+
+class ResultsSink(ABC):
+    @abstractmethod
+    def write(self, timestamp: str, urls: List[str], results: Dict[int, Dict]) -> None:
+        ...
+
+
+class NullResultsSink(ResultsSink):
+    def write(self, timestamp: str, urls: List[str], results: Dict[int, Dict]) -> None:
+        return None
+
+
+class FileResultsSink(ResultsSink):
+    def __init__(self, output_path: str) -> None:
+        self.output_path = output_path
+
+    def write(self, timestamp: str, urls: List[str], results: Dict[int, Dict]) -> None:
+        try:
+            with open(self.output_path, 'a', encoding='utf-8') as f:
+                f.write(f"\n[{timestamp}] Results for {len(urls)} URL(s)\n")
+                for _, data in sorted(results.items()):
+                    url = data.get("input_url") or data.get("checked_url")
+                    status = data.get("status_code") or "Invalid"
+                    ip = data.get("original_ip_port") or "IP:Port Not Found"
+                    redirect = data.get("final_url")
+                    redirect_ip = data.get("redirect_ip_port")
+                    redirect_str = f"Redirect: {redirect} ({redirect_ip})" if redirect else "Redirect: None"
+                    line = f"[Status: {status}] [IP: {ip}] [Time: {data.get('elapsed_ms') or '?'}ms] {url} [{redirect_str}]\n"
+                    f.write(line)
+        except Exception:
+            pass
+
+
+def build_results_sink(args) -> ResultsSink:
+    try:
+        if getattr(args, "output", None):
+            return FileResultsSink(args.output)
+    except Exception:
+        pass
+    return NullResultsSink()
+
+
+################################################################################
+# MAIN EXECUTION SECTION
+################################################################################
 
 async def main():
     colorama_init(autoreset=True)
@@ -791,29 +1088,22 @@ async def main():
         pass
     # Resolve password from in-memory cache or settings for use in SMTP send
     smtp_pw = resolve_smtp_password(settings)
-    expert = settings["mode"] == "expert"
-
     recipients = build_notification_targets(settings)
+    notifier: Notifier = build_notifier_from_settings(settings, smtp_pw, recipients)
+    mode_handler: ModeHandler = build_mode_handler_from_settings(settings)
+    confirmation_policy: DownConfirmationPolicy = build_down_confirmation_policy(settings)
+    results_sink: ResultsSink = build_results_sink(args)
 
     last_status_up: Dict[str, bool] = {}
 
     # Send a quick startup notification when monitoring begins
-    if settings["monitor"] and settings["notify"] != "none" and recipients:
+    if settings["monitor"] and not isinstance(notifier, NullNotifier):
         try:
             started_subject = "Monitoring started"
             started_body = (
                 f"Monitoring started for {len(urls)} URL(s): " + ", ".join(urls)
             )
-            ok = send_email_via_smtp(
-                settings["smtp_server"],
-                settings["smtp_port"],
-                settings["smtp_username"],
-                smtp_pw,
-                started_subject,
-                started_body,
-                settings.get("email") or settings.get("smtp_username") or "",
-                recipients,
-            )
+            ok = await notifier.send_alert(started_subject, started_body)
             if ok:
                 print("Startup notification sent to:", ", ".join(recipients))
             else:
@@ -822,33 +1112,16 @@ async def main():
         except Exception:
             pass
 
-    async def do_one_cycle(first_cycle: bool = False):
+    async def do_one_cycle():
         nonlocal last_status_up
         timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        results = await run_checks_once(urls, expert=expert)
+        results = await mode_handler.run_once(urls)
         print(f"\n[{timestamp}] Completed check for {len(urls)} URL(s)")
-        if settings["mode"] == "beginner":
-            print_beginner_view(results, show_spinner=False)
-        else:
-            print_results(results, settings["mode"])  # Grouped expert output
+        mode_handler.render(results)
         # Optional file output
-        if args.output:
-            try:
-                with open(args.output, 'a', encoding='utf-8') as f:
-                    f.write(f"\n[{timestamp}] Results for {len(urls)} URL(s)\n")
-                    for _, data in sorted(results.items()):
-                        url = data.get("input_url") or data.get("checked_url")
-                        status = data.get("status_code") or "Invalid"
-                        ip = data.get("original_ip_port") or "IP:Port Not Found"
-                        redirect = data.get("final_url")
-                        redirect_ip = data.get("redirect_ip_port")
-                        redirect_str = f"Redirect: {redirect} ({redirect_ip})" if redirect else "Redirect: None"
-                        line = f"[Status: {status}] [IP: {ip}] [Time: {data.get('elapsed_ms') or '?'}ms] {url} [{redirect_str}]\n"
-                        f.write(line)
-            except Exception:
-                pass
-        # Notifications on transitions
-        if settings["notify"] != "none" and recipients:
+        results_sink.write(timestamp, urls, results)
+        # Notifications on transitions (with double-check confirmation)
+        if not isinstance(notifier, NullNotifier):
             for _, data in results.items():
                 url = data.get("input_url") or data.get("checked_url")
                 status = data.get("status_code")
@@ -858,42 +1131,28 @@ async def main():
                 # Notify on first observation if down, and on transitions from up -> down
                 if was_up is None:
                     if not is_up_now:
-                        subject = f"ALERT: {url} is DOWN (status: {status})"
-                        body = build_down_message(url, data)
-                        ok = send_email_via_smtp(
-                            settings["smtp_server"],
-                            settings["smtp_port"],
-                            settings["smtp_username"],
-                            smtp_pw,
-                            subject,
-                            body,
-                            settings.get("email") or settings.get("smtp_username") or "",
-                            recipients,
-                        )
-                        if ok:
-                            print(f"Alert sent for {url} to:", ", ".join(recipients))
-                        else:
-                            if DEBUG:
-                                print(f"Warning: Failed to send alert for {url}. Check email/app password and provider settings.")
+                        is_really_down = await confirmation_policy.confirm(url or "")
+                        if is_really_down:
+                            subject = f"ALERT: {url} is DOWN (status: {status})"
+                            body = build_down_message(url, data)
+                            ok = await notifier.send_alert(subject, body)
+                            if ok:
+                                print(f"Alert sent for {url} to:", ", ".join(recipients))
+                            else:
+                                if DEBUG:
+                                    print(f"Warning: Failed to send alert for {url}. Check email/app password and provider settings.")
                 else:
                     if was_up and not is_up_now:
-                        subject = f"ALERT: {url} is DOWN (status: {status})"
-                        body = build_down_message(url, data)
-                        ok = send_email_via_smtp(
-                            settings["smtp_server"],
-                            settings["smtp_port"],
-                            settings["smtp_username"],
-                            smtp_pw,
-                            subject,
-                            body,
-                            settings.get("email") or settings.get("smtp_username") or "",
-                            recipients,
-                        )
-                        if ok:
-                            print(f"Alert sent for {url} to:", ", ".join(recipients))
-                        else:
-                            if DEBUG:
-                                print(f"Warning: Failed to send alert for {url}. Check email/app password and provider settings.")
+                        is_really_down = await confirmation_policy.confirm(url or "")
+                        if is_really_down:
+                            subject = f"ALERT: {url} is DOWN (status: {status})"
+                            body = build_down_message(url, data)
+                            ok = await notifier.send_alert(subject, body)
+                            if ok:
+                                print(f"Alert sent for {url} to:", ", ".join(recipients))
+                            else:
+                                if DEBUG:
+                                    print(f"Warning: Failed to send alert for {url}. Check email/app password and provider settings.")
                     elif (not was_up) and is_up_now:
                         # Optional: notify recovery? Keep silent to avoid noise.
                         pass
@@ -902,10 +1161,8 @@ async def main():
     if settings["monitor"]:
         print(f"Monitoring every {settings['interval']}s. Press Ctrl+C to stop.")
         try:
-            first = True
             while True:
-                await do_one_cycle(first_cycle=first)
-                first = False
+                await do_one_cycle()
                 # Add visible vertical spacing before the next loading bar
                 try:
                     print("\n" * 5, end="")
@@ -939,7 +1196,7 @@ async def main():
             print("\nMonitoring stopped by user.")
     else:
         # Single run
-        await do_one_cycle(first_cycle=True)
+        await do_one_cycle()
 
 if __name__ == "__main__":
     asyncio.run(main())
